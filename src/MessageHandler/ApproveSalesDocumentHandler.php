@@ -10,8 +10,11 @@ use App\Enum\SalesDocumentType;
 use App\Message\Command\ApproveSalesDocument;
 use App\Notification\NotifierPort;
 use App\Repository\SalesDocumentRepository;
+use DateTimeImmutable;
 use Doctrine\ORM\EntityManagerInterface;
+use Psr\Log\LoggerInterface;
 use Symfony\Component\Messenger\Attribute\AsMessageHandler;
+use Throwable;
 
 #[AsMessageHandler(bus: 'command.bus')]
 final class ApproveSalesDocumentHandler
@@ -20,23 +23,19 @@ final class ApproveSalesDocumentHandler
         private readonly EntityManagerInterface $entityManager,
         private readonly SalesDocumentRepository $repository,
         private readonly NotifierPort $notifier,
+        private readonly LoggerInterface $logger,
     ) {
     }
 
     public function __invoke(ApproveSalesDocument $command): int
     {
         $approvedId = $this->entityManager->wrapInTransaction(function () use ($command) {
-            $document = $this->repository->find($command->documentId);
-            if ($document === null) {
-                throw new \RuntimeException("Document {$command->documentId} not found");
-            }
-            if ($document->getStatus() !== SalesDocumentStatus::Draft) {
-                throw new \RuntimeException('Document cannot be approved in its current status');
-            }
+            $document = $this->repository->getOrFail($command->documentId);
+            $document->ensureIsDraft('approved');
 
             $document->setStatus(SalesDocumentStatus::Approved);
             $document->setApprovedBy($command->approvedBy);
-            $document->setApprovedAt(new \DateTimeImmutable());
+            $document->setApprovedAt(new DateTimeImmutable());
             $document->setSellerSnapshot($this->buildSellerSnapshot($document));
 
             $approvedId = $document->getId();
@@ -48,7 +47,7 @@ final class ApproveSalesDocumentHandler
                 $order->setType(SalesDocumentType::Order);
                 $order->setStatus(SalesDocumentStatus::Approved);
                 $order->setApprovedBy($command->approvedBy);
-                $order->setApprovedAt(new \DateTimeImmutable());
+                $order->setApprovedAt(new DateTimeImmutable());
                 $order->setParentQuoteId($document->getId());
                 $order->setSellerSnapshot($document->getSellerSnapshot());
                 $this->entityManager->persist($order);
@@ -59,18 +58,26 @@ final class ApproveSalesDocumentHandler
             return $approvedId;
         });
 
-        $approvedDocument = $this->repository->find($approvedId);
+        $approvedDocument = $this->repository->getOrFail($approvedId);
 
-        $this->notifier->notify(
-            $approvedDocument->getCreatedBy(),
-            "Document #{$approvedDocument->getId()} has been approved",
-        );
-        $this->notifier->notify(
-            $approvedDocument->getContractorId(),
-            "Document #{$approvedDocument->getId()} has been approved",
-        );
+        $message = "Document #{$approvedDocument->getId()} has been approved";
+        $this->notifySafely($approvedDocument->getCreatedBy(), $message);
+        $this->notifySafely($approvedDocument->getContractorId(), $message);
 
         return $approvedId;
+    }
+
+    private function notifySafely(int $userId, string $message): void
+    {
+        try {
+            $this->notifier->notify($userId, $message);
+        } catch (Throwable $e) {
+            $this->logger->error('Failed to notify user {userId} about sales document approval: {message}', [
+                'userId' => $userId,
+                'message' => $e->getMessage(),
+                'exception' => $e,
+            ]);
+        }
     }
 
     /**
@@ -80,7 +87,7 @@ final class ApproveSalesDocumentHandler
     {
         return [
             'contractor_id' => $document->getContractorId(),
-            'snapshot_at' => (new \DateTimeImmutable())->format(DATE_ATOM),
+            'snapshot_at' => (new DateTimeImmutable())->format(DATE_ATOM),
         ];
     }
 }

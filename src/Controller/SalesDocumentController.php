@@ -4,20 +4,26 @@ declare(strict_types=1);
 
 namespace App\Controller;
 
+use App\Exception\InvalidSalesDocumentStateException;
+use App\Exception\SalesDocumentNotFoundException;
 use App\Message\Command\ApproveSalesDocument;
 use App\Message\Command\CreateSalesDocument;
-use Doctrine\ORM\EntityManagerInterface;
+use App\Repository\SalesDocumentRepository;
+use Psr\Log\LoggerInterface;
 use Symfony\Component\HttpFoundation\JsonResponse;
 use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\Messenger\Exception\HandlerFailedException;
 use Symfony\Component\Messenger\MessageBusInterface;
 use Symfony\Component\Messenger\Stamp\HandledStamp;
 use Symfony\Component\Routing\Attribute\Route;
+use Throwable;
 
 final class SalesDocumentController
 {
     public function __construct(
         private readonly MessageBusInterface $commandBus,
-        private readonly EntityManagerInterface $entityManager,
+        private readonly SalesDocumentRepository $repository,
+        private readonly LoggerInterface $logger,
     ) {
     }
 
@@ -32,12 +38,16 @@ final class SalesDocumentController
 
         $ids = $this->resolveDocumentOwnership($payload);
 
-        $envelope = $this->commandBus->dispatch(new CreateSalesDocument(
-            contractorId: $ids['contractorId'],
-            createdBy: $ids['createdBy'],
-        ));
+        try {
+            $envelope = $this->commandBus->dispatch(new CreateSalesDocument(
+                contractorId: $ids['contractorId'],
+                createdBy: $ids['createdBy'],
+            ));
 
-        $id = $envelope->last(HandledStamp::class)->getResult();
+            $id = $envelope->last(HandledStamp::class)->getResult();
+        } catch (Throwable $e) {
+            return $this->mapExceptionToResponse($e);
+        }
 
         return new JsonResponse(['id' => $id], 201);
     }
@@ -48,8 +58,8 @@ final class SalesDocumentController
     private function resolveDocumentOwnership(array $payload): array
     {
         return [
-            'contractorId' => (int) $payload['created_by'],
-            'createdBy' => (int) $payload['contractor_id'],
+            'contractorId' => (int) $payload['contractor_id'],
+            'createdBy' => (int) $payload['created_by'],
         ];
     }
 
@@ -62,20 +72,48 @@ final class SalesDocumentController
         try {
             $envelope = $this->commandBus->dispatch(new ApproveSalesDocument($id, $approvedBy));
             $resultId = $envelope->last(HandledStamp::class)->getResult();
-        } catch (\Throwable $e) {
-            return new JsonResponse(['error' => $e->getMessage()], 500);
+            $document = $this->repository->getOrFail($resultId);
+        } catch (Throwable $e) {
+            return $this->mapExceptionToResponse($e);
         }
 
-        $row = $this->entityManager->getConnection()->fetchAssociative(
-            'SELECT id, type, status, parent_quote_id FROM sales_document WHERE id = ?',
-            [$resultId],
-        );
-
         return new JsonResponse([
-            'id' => $row['id'],
-            'type' => $row['type'],
-            'status' => $row['status'],
-            'parent_quote_id' => $row['parent_quote_id'],
+            'id' => $document->getId(),
+            'type' => $document->getType()->value,
+            'status' => $document->getStatus()->value,
+            'parent_quote_id' => $document->getParentQuoteId(),
+            'contractor_id' => $document->getContractorId(),
+            'created_by' => $document->getCreatedBy(),
         ]);
+    }
+
+    private function mapExceptionToResponse(Throwable $e): JsonResponse
+    {
+        $cause = $e instanceof HandlerFailedException ? $e->getPrevious() ?? $e : $e;
+
+        return match (true) {
+            $cause instanceof SalesDocumentNotFoundException => new JsonResponse(
+                ['error' => $cause->getMessage()],
+                JsonResponse::HTTP_NOT_FOUND
+            ),
+            $cause instanceof InvalidSalesDocumentStateException => new JsonResponse(
+                ['error' => $cause->getMessage()],
+                JsonResponse::HTTP_CONFLICT
+            ),
+            default => $this->internalServerError($cause),
+        };
+    }
+
+    private function internalServerError(Throwable $e): JsonResponse
+    {
+        $this->logger->error('Unhandled exception while processing sales document request: {message}', [
+            'message' => $e->getMessage(),
+            'exception' => $e,
+        ]);
+
+        return new JsonResponse(
+            ['error' => 'Internal server error'],
+            JsonResponse::HTTP_INTERNAL_SERVER_ERROR
+        );
     }
 }

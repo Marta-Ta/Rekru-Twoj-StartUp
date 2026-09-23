@@ -37,14 +37,44 @@ final class SalesDocumentControllerTest extends WebTestCase
         $body = json_decode($this->client->getResponse()->getContent(), true);
         self::assertSame('order', $body['type']);
         self::assertSame($quoteId, $body['parent_quote_id']);
+        self::assertSame(77, $body['contractor_id']);
+        self::assertSame(9, $body['created_by']);
     }
 
-    public function testApprovingMissingDocumentCurrentlyReturns500(): void
+    public function testApprovingMissingDocumentReturns404(): void
     {
-        $this->client->request('POST', '/sales-documents/999999/approve', server: ['CONTENT_TYPE' => 'application/json'], content: json_encode([
-            'approved_by' => 9,
-        ]));
+        $this->client->request(
+            'POST',
+            '/sales-documents/999999/approve',
+            server: ['CONTENT_TYPE' => 'application/json'],
+            content: json_encode(['approved_by' => 9])
+        );
 
-        self::assertResponseStatusCodeSame(500);
+        self::assertResponseStatusCodeSame(404);
+    }
+
+    public function testApprovingAnAlreadyApprovedDocumentReturns409(): void
+    {
+        $this->client->request(
+            'POST',
+            '/sales-documents',
+            server: ['CONTENT_TYPE' => 'application/json'],
+            content: json_encode([
+                'contractor_id' => 77,
+                'created_by' => 3,
+            ])
+        );
+        $quoteId = json_decode($this->client->getResponse()->getContent(), true)['id'];
+        $uriWithId = sprintf('/sales-documents/%s/approve', $quoteId);
+        $server = ['CONTENT_TYPE' => 'application/json'];
+        $content = json_encode(['approved_by' => 9]);
+
+        $this->client->request('POST', $uriWithId, server: $server, content: $content);
+
+        self::assertResponseIsSuccessful();
+
+        $this->client->request('POST', $uriWithId, server: $server, content: $content);
+
+        self::assertResponseStatusCodeSame(409);
     }
 }

@@ -9,3 +9,9 @@ services:
         resource: '../src/'
 
     App\Notification\NotifierPort: '@App\Notification\LogNotifier'
+
+    logger:
+        class: Symfony\Component\HttpKernel\Log\Logger
+        arguments:
+            $minLevel: 'debug'
+            $output: '%kernel.logs_dir%/%kernel.environment%.log'
